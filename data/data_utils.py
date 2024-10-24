@@ -14,7 +14,7 @@ from tqdm import tqdm
 # Set up logging, especially in Kaggle
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
-logging.basicConfig(stream = sys.stdout, level=logging.DEBUG)
+logging.basicConfig(stream = sys.stdout, level=logging.INFO)
 
 class DrugPairDataset():
     def __init__(self, data_path, drug_info_path,
@@ -126,8 +126,8 @@ class DrugPairDataset():
                 self.valid_drugs_set.add(drug)
 
         self.label_set = {item: index+1 for index, item in enumerate(self.label_set)}
-        logging.info("The label set is:\n", self.label_set)
-        logging.info("Data len from csv:", )
+        logging.info(f"The label set is:\n{self.label_set}")
+        # logging.info("Data len from csv:", )
         self.label = [self.label_set[i] for i in self.label]
         
         # Add false data
@@ -223,7 +223,7 @@ class DrugPairDataset():
         self.test_dataset += false_data_test
         self.test_label += false_label_test
 
-        logging.info(len(self.train_dataset), len(self.test_dataset))
+        logging.info(f"Training dataset size: {len(self.train_dataset)}, Test dataset size: {len(self.test_dataset)}")
         logging.info("Let the dataloader handle the suffling")
 
         
@@ -271,7 +271,7 @@ class DrugPairDataset():
                         self.pairs_set.add((drugs_list[idx1], drugs_list[idx2]))
                         amount+=1
                         pbar.update(1)
-        logging.info("False data added:", amount)
+        logging.info("False data added: %d" % amount)
         return false_data
     
     def get_false_direct_data(self, pair_drugs_list, sampled_pairs):
@@ -302,7 +302,7 @@ class DrugPairDataset():
                 pbar.update(1)
                 if amount>=sampled_pairs:
                     break
-        logging.info("False direct data added:", amount)
+        logging.info("False direct data added: %d", amount)
         return false_data
     
 def write_to_csv(triples, filename, header=["Drug1", "Interaction", "Drug2"]):

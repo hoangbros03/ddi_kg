@@ -14,7 +14,7 @@ from data_utils import DrugPairDataset
 # Set up logging, especially in Kaggle
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
-logging.basicConfig(stream = sys.stdout, level=logging.DEBUG)
+logging.basicConfig(stream = sys.stdout, level=logging.INFO)
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser(description='Generate embeddings for drugs using BiomedBERT')

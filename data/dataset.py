@@ -22,16 +22,15 @@ class DrugDataset(Dataset):
         dr2 = self.data[idx][1]
         label = self.labels[idx]
 
-        embeds = list()
-        for info in self.type_info:
-            embed1 = self.id2allembedding[dr1][info]
-            embed2 = self.id2allembedding[dr2][info]
-            info_embed = torch.cat((embed1, embed2), dim=1)
-            embeds.append(info_embed)
+        embed1, embed2 = list(), list()
 
-        embed = torch.cat(embeds, dim=1)
+        for info in self.type_info:
+            embed1.append(self.id2allembedding[dr1][info])
+            embed2.append(self.id2allembedding[dr2][info])
+
+        embed = tuple(embed1 + embed2 + label)
         
-        return embed, label
+        return embed
     
 def process_formula(string):   
     """
