@@ -50,14 +50,14 @@ if __name__=="__main__":
     )
 
     id2allembedding_cls = get_dict_embedding(drug_pair_dataset, tokenizer, model, device, take_cls=True, use_bfloat16=args.use_bfloat16)
-    # id2allembedding_full = get_dict_embedding(drug_pair_dataset, tokenizer, model, device, take_cls=False, use_bfloat16=args.use_bfloat16)
+    id2allembedding_full = get_dict_embedding(drug_pair_dataset, tokenizer, model, device, take_cls=False, use_bfloat16=args.use_bfloat16)
 
     # Don't pass id2allembedding to save the memory. Use it later
-    train_dataset = DrugDataset(drug_pair_dataset.train_dataset, drug_pair_dataset.train_label, None)
-    test_dataset = DrugDataset(drug_pair_dataset.test_dataset, drug_pair_dataset.test_label, None)
+    train_dataset = DrugDataset(drug_pair_dataset.train_dataset, drug_pair_dataset.train_label, ["name", "description", "isomeric_smiles", "formula"], None)
+    test_dataset = DrugDataset(drug_pair_dataset.test_dataset, drug_pair_dataset.test_label, ["name", "description", "isomeric_smiles", "formula"], None)
 
     torch.save(id2allembedding_cls, args.output_folder + "/id2allembedding_cls.pt")
-    # torch.save(id2allembedding_full, args.output_folder + "/id2allembedding_full.pt")
+    torch.save(id2allembedding_full, args.output_folder + "/id2allembedding_full.pt")
     torch.save(train_dataset, args.output_folder + "/train_dataset.pt")
     torch.save(test_dataset, args.output_folder + "/test_dataset.pt")
 
