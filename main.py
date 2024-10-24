@@ -3,6 +3,8 @@ import random
 import sys
 import tempfile
 import time
+import logging
+import argparse
 
 import numpy as np
 import pandas as pd
@@ -16,252 +18,105 @@ import torch.multiprocessing as mp
 from torch import nn, optim
 from torch.autograd import Variable
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms, utils
 from transformers import AutoModel, AutoTokenizer
+import yaml
 
-# On Windows platform, the torch.distributed package only
-# supports Gloo backend, FileStore and TcpStore.
-# For FileStore, set init_method parameter in init_process_group
-# to a local file. Example as follow:
-# init_method="file:///f:/libtmp/some_file"
-# dist.init_process_group(
-#    "gloo",
-#    rank=rank,
-#    init_method=init_method,
-#    world_size=world_size)
-# For TcpStore, same way as on Linux.
+from data.dataset import DrugDataset
+from models.model import MLPModel, CNNModel
 
-class DrugPairDataset():
-    def __init__(self, data_path, 
-                 drug_description_dict,
-                 train_ratio=0.8,
-                 type_info="description", 
-                 handle_direct=False, 
-                 column_names=['drug1', 'drug2', 'label', 'origin_label'], 
-                 seed=42,
-                 undirect=False,
-                false_set_limit=10000):
-        self.data_path = data_path
-        self.drug_description_dict = drug_description_dict
-        self.train_ratio= train_ratio
-        self.handle_direct = handle_direct
-        self.type_info=type_info
-        self.seed= seed
-        self.false_set_limit = false_set_limit
-        self.data = []
-        self.label = []
-        self.label_set = set()
-        self.undirect = undirect
-
-        self.handle_dataset(data_path, handle_direct, column_names)
-        # Split train test
-        
-    def handle_dataset(self, path, handle_direct, column_names):
-        """
-        Receive a csv file as input, including columns: Drug1, Drug2, label, origin_label.
-        """
-        drug1, drug2, label, origin_label = column_names
-        df = pd.read_csv(path)
-        self.drugs_set = set()
-        self.pairs_set = set()
-        self.undirect_pairs_set = set()
-
-        # Add to set and data
-        for i in tqdm(range(len(df[drug1]))):
-            drug1_id = df[drug1][i].split("::")[-1]
-            drug2_id = df[drug2][i].split("::")[-1]
-
-            drug1_info = get_drug_description(self.drug_description_dict, drug1_id)
-            drug2_info = get_drug_description(self.drug_description_dict, drug2_id)
-            
-            int_label = df[label][i]
-            # Check before add:
-            if self.undirect and ((drug1_info, drug2_info) in self.pairs_set or (drug2_info, drug1_info) in self.pairs_set):
-                continue
-            self.data.append([drug1_info, drug2_info])
-            self.pairs_set.add((drug1_info, drug2_info))
-            
-            if int_label == 'New Adverse':
-                self.undirect_pairs_set.add((drug1_info, drug2_info))
-            elif self.undirect:
-                self.undirect_pairs_set.add((drug1_info, drug2_info))
-
-            
-            self.drugs_set.add(drug1_info)
-            self.drugs_set.add(drug2_info)
-            self.label.append(int_label)
-            self.label_set.add(int_label)
-            
-        self.label_set = {item: index+1 for index, item in enumerate(self.label_set)}
-        print("The label set is:\n", self.label_set)
-        print("Data len from csv:", )
-        self.label = [self.label_set[i] for i in self.label]
-        
-        # Add false data
-        false_data = self.get_false_data()
-        false_label = [0] * len(false_data)
-        self.data.extend(false_data)
-        self.label.extend(false_label)
-        self.label_set['No Interaction'] = 0
-        
-        # Split train test
-        self.shuffle_list = list(range(len(self.label)))
-        random.shuffle(self.shuffle_list)
-        self.shuffle_train_list = self.shuffle_list[:int(len(self.label)*self.train_ratio)]
-        self.shuffle_test_list = self.shuffle_list[int(len(self.label)*self.train_ratio):]
-        self.train_dataset = []
-        self.train_label = []
-        self.test_dataset = []
-        self.test_label = []
-        
-        for i in self.shuffle_train_list:
-            self.train_dataset.append(self.data[i])
-            self.train_label.append(self.label[i])
-        
-        for i in self.shuffle_test_list:
-            self.test_dataset.append(self.data[i])
-            self.test_label.append(self.label[i])
-        
-    def get_false_data(self):
-        false_data = []
-        amount = 0
-        drugs_amount = len(self.drugs_set)
-        drugs_list = list(self.drugs_set)
-        random.seed(self.seed)
-        with tqdm(total=self.false_set_limit) as pbar:
-            while True:
-                idx1, idx2 = random.randint(0, drugs_amount-1), random.randint(0, drugs_amount-1)
-                if (drugs_list[idx1], drugs_list[idx2]) in self.pairs_set:
-                    continue
-                if (drugs_list[idx2], drugs_list[idx1]) in self.undirect_pairs_set: # Correct logic, but tricky!
-                    # nếu cặp reverse đã tồn tại và là nhãn vô hướng thì không cho là negative sample
-                    continue
-                false_data.append([drugs_list[idx1], drugs_list[idx2]])
-                self.pairs_set.add((drugs_list[idx1], drugs_list[idx2]))
-                amount+=1
-                pbar.update(1)
-                if amount>=self.false_set_limit:
-                    break
-        return false_data
-
-def create_drug_description_dict(csv_file):
-    """Creates a dictionary mapping drug IDs to their descriptions."""
-    # Read the CSV file into a pandas DataFrame
-    df = pd.read_csv(csv_file)
-    # Replace null descriptions with drug names
-    df['description'] = df['description'].fillna(df['name'])
-    # Create a dictionary from the DataFrame
-    drug_description_dict = df.set_index('drug-id')['description'].to_dict()
-    return drug_description_dict
-
-class DrugDataset(Dataset):
-    def __init__(self, data, labels, id_to_cls_token_embed):
-        self.data = data
-        self.labels = labels
-        self.id_to_cls_token_embed = id_to_cls_token_embed
-        
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        # Extract the label and the pair (name1, name2) from the DataFrame
-        
-        embed1 = self.id_to_cls_token_embed[self.data[idx][0]]
-        embed2 = self.id_to_cls_token_embed[self.data[idx][1]]
-        label = self.labels[idx]
-        
-        return embed1, embed2, label
-    
-# def setup(rank, world_size):
-#     os.environ['MASTER_ADDR'] = 'localhost'
-#     os.environ['MASTER_PORT'] = '5554'
-
-#     # initialize the process group
-#     dist.init_process_group("gloo", rank=rank, world_size=world_size)
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+logging.basicConfig(stream = sys.stdout, level=logging.INFO)
 
 def setup(rank, world_size):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     
 def cleanup():
     dist.destroy_process_group()
-
-
-def launch(seed, run_name, train_dataset, test_dataset, model="MLP", lr=1e-4, num_epochs=1, save_model_path="checkpoint.pt"):
-    # TODO: GET IT FROM CONFIG
-    wandb.login(key=secret_value_0)
-    user = "re-2023"
-    project = "DDI_Oct_2024"
-    display_name = run_name
-
-    wandb.init(entity=user, project=project, name=display_name)
-    print("Seed: ", seed)
-    
-    train_loader = DataLoader(train_dataset, batch_size = 128, shuffle=True)
-    val_loader = DataLoader(test_dataset, batch_size = 128, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size = 128, shuffle=False)
-    
-    dataloader = {'train':train_loader, 'val':val_loader, 'test': test_loader}
-    print("Model", model)
-    print(f"Setting seed to {seed}")
+        
+def run(config):
+    # Set seed
+    seed = config['task']['seed']
+    logging.info(f"Setting seed to {seed}")
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    
-    if model=="MLP":
-        model = MLPModel()
-    else:
-        model = CNNModel()
-    print(model)
-    dataset_sizes = {
-        "train": len(train_dataset),
-        "test": len(test_dataset),
-        "dev": len(test_dataset)
-    }
 
+    use_name= config['dataset']['use_name']
+    use_description = config['dataset']['use_description']
+    use_smile = config['dataset']['use_smile']
+    use_formula = config['dataset']['use_formula']
+
+    # Init model
+    if config['model']['model_type'] == "MLPModel":
+        model = MLPModel(use_name=use_name, use_description=use_description, use_smile=use_smile, use_formula=use_formula)
+    elif config['model']['model_type'] == "CNNModel":
+        model = CNNModel(use_name=use_name, use_description=use_description, use_smile=use_smile, use_formula=use_formula)
+    else:
+        raise ValueError(f"Model type {config['model']['model_type']} not supported")
     
-    wandb.finish()
-        
-def run():
-    model = CNNModel()
-    dataset_sizes = {
-            "train": len(train_direct_dataset),
-            "test": len(test_direct_dataset),
-            "dev": len(test_direct_dataset)
-        }
-    # dataloader = {'train':train_loader, 'val':val_loader, 'test': test_loader}
-    print("Model", model)
+    logging.info(f"Model: {model}")
     world_size = torch.cuda.device_count()
 #     model, lr, num_epochs, save_model_path, dataloaders, dataset_sizes,  world_size
     mp.spawn(train_model,
-             args=(model, 1e-4, 1, 'good.pt', train_direct_dataset, test_direct_dataset, dataset_sizes, world_size),
+             args=(model, world_size, config),
              nprocs=world_size,
              join=True)
 
     
-def train_model(rank, model, lr, num_epochs, save_model_path, train_direct_dataset, test_direct_dataset, dataset_sizes, world_size):
+def train_model(rank, model, world_size, config):
     setup(rank, world_size)
     torch.cuda.set_device(rank)
     
+    # Unpack config
+    lr = config['optimizer']['lr']
+    num_epochs = config['task']['epochs']
+    load_model_path = config['task']['load_checkpoint_path']
+    save_model_path = config['task']['save_checkpoint_path']
+    batch_size = config['task']['batch_size']
+    optimizer_type = config['optimizer']['optimizer_type']
+    do_train = config['task']['train']
+    do_test = config['task']['test']
+
+    # Handle dataloader
+    train_dataset = config['train_dataset']
+    test_dataset = config['test_dataset']
+    dataset_sizes = {
+            "train": len(train_dataset),
+            "test": len(test_dataset),
+            "dev": len(test_dataset)
+        }
     
-    train_loader = DataLoader(train_direct_dataset, batch_size = 128, sampler=DistributedSampler(train_direct_dataset))
-    val_loader = DataLoader(test_direct_dataset, batch_size = 128, sampler=DistributedSampler(test_direct_dataset))
-    test_loader = DataLoader(test_direct_dataset, batch_size = 128, sampler=DistributedSampler(test_direct_dataset))
+    train_loader = DataLoader(train_dataset, batch_size = batch_size, sampler=DistributedSampler(train_dataset))
+    val_loader = DataLoader(test_dataset, batch_size = batch_size, sampler=DistributedSampler(test_dataset))
+    test_loader = DataLoader(test_dataset, batch_size = batch_size, sampler=DistributedSampler(test_dataset))
     dataloaders = {'train':train_loader, 'val':val_loader, 'test': test_loader}
     
+    if load_model_path:
+        model.load_state_dict(torch.load(load_model_path))
+
     model = model.to(rank)
     model = DDP(model, device_ids=[rank])
     
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    if optimizer_type == "Adam":
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+    elif optimizer_type == "AdamW":
+        optimizer = optim.AdamW(model.parameters(), lr=lr)
+    else:
+        raise ValueError(f"Optimizer type {optimizer_type} not supported")
     
     for epoch in range(num_epochs):
-        print(f'Epoch {epoch}/{num_epochs - 1}')
-        print('-' * 10)
+        logging.info(f'Epoch {epoch}/{num_epochs - 1}')
+        logging.info('-' * 10)
 
         # Each epoch has a training and validation phase
         for phase in ['train', 'val']:
@@ -281,25 +136,28 @@ def train_model(rank, model, lr, num_epochs, save_model_path, train_direct_datas
 
             total_batches = len(dataloaders[phase])
             # Iterate over data
-            for embed1, embed2, labels in tqdm(dataloaders[phase], desc=f"{phase.capitalize()} Progress", total=total_batches):
-                embed1 = embed1.to(rank).to(torch.float32)
-                embed2 = embed2.to(rank).to(torch.float32)
-                labels = labels.to(rank).long()
+            for data in tqdm(dataloaders[phase], desc=f"{phase.capitalize()} Progress", total=total_batches):
+                # TODO: Re-check it and implement it in the model!
+                # embed1 = embed1.to(rank).to(torch.float32)
+                # embed2 = embed2.to(rank).to(torch.float32)
+                labels = data[-1].to(rank).long()
 
                 optimizer.zero_grad()
+                if phase == 'train':
+                    outputs = model(data)
+                else:
+                    with torch.no_grad():
+                        outputs = model(data)
 
-                # Forward pass
-                with torch.set_grad_enabled(phase == 'train'):
-                    outputs = model(embed1, embed2)
-                    _, preds = torch.max(outputs, 1)
-                    all_labels.extend(labels.cpu().numpy())
-                    all_preds.extend(preds.cpu().numpy())
-                    loss = criterion(outputs, labels)
+                _, preds = torch.max(outputs, 1)
+                all_labels.extend(labels.cpu().numpy())
+                all_preds.extend(preds.cpu().numpy())
+                loss = criterion(outputs, labels)
 
-                    # Backward pass and optimization only if in training phase
-                    if phase == 'train':
-                        loss.backward()
-                        optimizer.step()
+                # Backward pass and optimization only if in training phase
+                if phase == 'train':
+                    loss.backward()
+                    optimizer.step()
 
                 # Statistics
                 running_loss += loss.item() * labels.size(0)
@@ -309,7 +167,7 @@ def train_model(rank, model, lr, num_epochs, save_model_path, train_direct_datas
             epoch_acc = running_corrects.double() / dataset_sizes[phase]
 
             if rank == 0:  # Only log from the main process
-                print(f'{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
+                logging.info(f'{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
                 wandb.log({
                     f'{phase}/loss': epoch_loss,
                     f'{phase}/acc': epoch_acc
@@ -330,8 +188,8 @@ def train_model(rank, model, lr, num_epochs, save_model_path, train_direct_datas
                                 wandb.log({f"{label}/{metric_name}": metric_value})
                         else:
                             wandb.log({label: metrics})
-                    print(report)
-                    print("Without the negative label:")
+                    logging.info(report)
+                    logging.info("Without the negative label:")
                     report = classification_report(
                         y_true=all_labels, 
                         y_pred=all_preds, 
@@ -340,59 +198,75 @@ def train_model(rank, model, lr, num_epochs, save_model_path, train_direct_datas
                         digits=4,  
                         output_dict=True
                     )
-                    print(report)
+                    logging.info(report)
 
-        if rank == 0:
-            torch.save(model.state_dict(), save_model_path)
+        if rank == 0 and save_model_path:
+            torch.save(model.state_dict(), config['output_dir'] + save_model_path)
             
     cleanup()
     return model
 
 if __name__ == "__main__":
-    WANDB_KEY="7801339f18c9b00cf55e8f3c250afa3cba1d141b"
-    DIRECT_PAIRS_PATH= "/kaggle/input/drugpair-ddi-15oct2024/drug_separate_direct_drugpairdataset.pt"
-    UNDIRECT_PAIRS_PATH= "/kaggle/input/drugpair-ddi-15oct2024/drug_separate_undirect_drugpairdataset.pt"
-    DRUG_DESC_CSV_PATH= '/kaggle/input/drugbank-ddi/drug_data.csv'
-    bert_model_name='microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract'
-
-    tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
-    biomedbert = AutoModel.from_pretrained(bert_model_name).cuda()
-    device='cuda'
-
-    drug_description_dict = create_drug_description_dict(DRUG_DESC_CSV_PATH)
-    drug_description_dict['DB09368'] = 'Corticotropin zinc hydroxide'
-    descriptions = [(id, desc) for id, desc in drug_description_dict.items()]
-
-    # Create a DataLoader for batching
-    batch_size = 128  # Adjust based on memory
-    data_loader = DataLoader(descriptions, batch_size=batch_size, shuffle=False)
-
-    descs_to_cls_token_embed = {}
-    for batch in tqdm(data_loader, desc="Processing batches"):
-        ids, descs = batch
-        
-        inputs = tokenizer(list(descs), return_tensors="pt", padding='max_length', truncation=True, max_length=256).to(device)
-        
-        with torch.no_grad():
-            outputs = biomedbert(**inputs)
-        
-        # Extract and save the CLS token embedding for each description
-        for idx, descs in enumerate(descs):
-            descs_to_cls_token_embed[descs] = outputs.last_hidden_state[idx, :, :].to(torch.bfloat16).cpu()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, required=True, help='Path to the yaml config file')
+    args = parser.parse_args()
+    with open('config.yaml') as f:
+        config = yaml.safe_load(f)
 
     # FILE
-    direct_pairs = torch.load(DIRECT_PAIRS_PATH)
-    undirect_pairs = torch.load(UNDIRECT_PAIRS_PATH)
-    train_direct_dataset = DrugDataset(direct_pairs.train_dataset, direct_pairs.train_label, descs_to_cls_token_embed)
-    test_direct_dataset = DrugDataset(direct_pairs.test_dataset, direct_pairs.test_label, descs_to_cls_token_embed)
-    train_indirect_dataset = DrugDataset(undirect_pairs.train_dataset, undirect_pairs.train_label, descs_to_cls_token_embed)
-    test_indirect_dataset = DrugDataset(undirect_pairs.test_dataset, undirect_pairs.test_label, descs_to_cls_token_embed)
+    train_dataset = torch.load(config['train_dataset_path'])
+    test_dataset = torch.load(config['test_dataset_path'])
+    id2embedding = torch.load(config['id2embedding_path'])
+    train_dataset.id2embedding = id2embedding
+    test_dataset.id2embedding = id2embedding
 
+    config['train_dataset'] = train_dataset
+    config['test_dataset'] = test_dataset
+
+    # Init wandb
+    if config['wandb']['log']:
+        wandb.login(key=config['wandb']['api_key'])
+        user = config['wandb']['user']
+        project = config['wandb']['project_name']
+        display_name = config['wandb']['display_name']
+        wandb.init(entity=user, project=project, name=display_name)
 
     n_gpus = torch.cuda.device_count()
-    print(f"total GPUs: {n_gpus}")
-    assert n_gpus >= 2, f"Requires at least 2 GPUs to run, but got {n_gpus}"
+    logging.info(f"total GPUs: {n_gpus}")
+    # assert n_gpus >= 2, f"Requires at least 2 GPUs to run, but got {n_gpus}"
+    # TODO: Check if it can run with 1 gpu
     world_size = n_gpus
-    run()
+    run(config)
     
     
+# def launch(seed, run_name, train_dataset, test_dataset, model="MLP", lr=1e-4, num_epochs=1, save_model_path="checkpoint.pt"):
+#     # TODO: GET IT FROM CONFIG
+#     wandb.login(key=secret_value_0)
+#     user = "re-2023"
+#     project = "DDI_Oct_2024"
+#     display_name = run_name
+
+#     wandb.init(entity=user, project=project, name=display_name)
+#     logging.info("Seed: ", seed)
+    
+#     train_loader = DataLoader(train_dataset, batch_size = 128, shuffle=True)
+#     val_loader = DataLoader(test_dataset, batch_size = 128, shuffle=True)
+#     test_loader = DataLoader(test_dataset, batch_size = 128, shuffle=False)
+    
+#     dataloader = {'train':train_loader, 'val':val_loader, 'test': test_loader}
+#     logging.info("Model", model)
+#     
+    
+#     if model=="MLP":
+#         model = MLPModel()
+#     else:
+#         model = CNNModel()
+#     logging.info(model)
+#     dataset_sizes = {
+#         "train": len(train_dataset),
+#         "test": len(test_dataset),
+#         "dev": len(test_dataset)
+#     }
+
+    
+#     wandb.finish()

@@ -136,9 +136,8 @@ def get_dict_embedding(drugpairdataset, tokenizer, model, device, take_cls=False
             torch.Tensor: The embedding of the input text, represented as a PyTorch tensor.
         """
         inputs = tokenizer(text, return_tensors='pt', truncation=True, padding='max_length', max_length=max_length).to(device)
-        with torch.no_grad():
-            outputs = model(**inputs)
-
+        model.eval()
+        outputs = model(**inputs)
         embedding = outputs.last_hidden_state.to("cpu")
         if take_cls:
             embedding = embedding[:, 0, :]

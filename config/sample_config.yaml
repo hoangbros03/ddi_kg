@@ -1,0 +1,41 @@
+output_dir: ../outputs
+wandb:
+  log: True
+  user:
+  project_name: 
+  api_key: 
+  display_name:
+
+dataset:
+  train_dataset_path: 
+  test_dataset_path: 
+  id2embedding_path:
+  use_name: True
+  use_description: True
+  use_smile: True
+  use_formula: True
+
+model:
+  model_type: MLPModel
+  hidden_size: 768
+  num_class: 4
+  dropout_rate: 0.3
+  activation_fn: relu
+  # If mlp
+  mlp_hidden_dims: [512, 256]
+  # If cnn
+  conv_window_size: [3, 5, 7]
+  out_conv_list_dim: 128
+
+task:
+  train: True
+  epochs: 10
+  batch_size: 128
+  load_checkpoint_path:
+  save_checkpoint_path: 
+  test: True
+  seed: 42
+
+optimizer:
+  optimizer_type: AdamW
+  lr: 5.0e-4
