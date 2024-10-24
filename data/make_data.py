@@ -8,8 +8,8 @@ from transformers import AutoModel, AutoTokenizer
 import torch
 from tqdm import tqdm
 
-from .dataset import DrugDataset, process_formula, get_dict_embedding
-from .data_utils import DrugPairDataset
+from dataset import DrugDataset, process_formula, get_dict_embedding
+from data_utils import DrugPairDataset
 
 # Set up logging, especially in Kaggle
 for handler in logging.root.handlers[:]:
